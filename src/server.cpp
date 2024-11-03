@@ -7,6 +7,8 @@
 #include <sys/socket.h>
 #include <netdb.h>
 
+#define CHECK_CALL(func, ...) check_error(#func, func(__VA_ARGS__))
+
 int check_error(const char* msg, int res) {
     if (res == -1) {
         fmt::print("{}: {}\n", msg, strerror(errno));
@@ -28,11 +30,14 @@ struct address_resolved_entry {
     }
 
     int create_socket() const {
-        int sockfd = socket(m_curr->ai_family, m_curr->ai_socktype, m_curr->ai_protocol);
-        if (sockfd == -1) {
-            fmt::print("socket: {}", strerror(errno));
-            throw;
-        }
+        int sockfd = CHECK_CALL(socket, m_curr->ai_family, m_curr->ai_socktype, m_curr->ai_protocol);
+        return sockfd;
+    }
+
+    int create_socket_and_bind() const {
+        int sockfd = create_socket();
+        socket_address_fatptr serve_addr = get_address();
+        CHECK_CALL(bind, sockfd, serve_addr.m_addr, serve_addr.m_addrlen);
         return sockfd;
     }
 
@@ -78,9 +83,9 @@ int main() {
     address_resolver resolver;
     resolver.resolve("127.0.0.1", "8080");
     auto entry = resolver.get_first_entry();
-    int sockfd = entry.create_socket();
-    socket_address_fatptr addr = entry.get_address();
-    check_error("bind", bind(sockfd, addr.m_addr, addr.m_addrlen));
-    check_error("listen", listen(sockfd, SOMAXCONN));
+    int listenfd = entry.create_socket_and_bind();
+    CHECK_CALL(listen, listenfd, SOMAXCONN);
+    socket_address_storage addr;
+    int connid = CHECK_CALL(accept, listenfd, &addr.m_addr, &addr.m_addrlen);
     
 }
