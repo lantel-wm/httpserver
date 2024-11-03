@@ -1,8 +1,10 @@
+#include <algorithm>
 #include <cerrno>
 #include <cstddef>
 #include <cstdio>
 #include <cstring>
 #include <fmt/format.h>
+#include <map>
 #include <string>
 #include <string_view>
 #include <sys/types.h>
@@ -105,9 +107,60 @@ struct address_resolver {
     }
 };
 
+using StringMap = std::map<std::string, std::string>;
+
+struct http11_header_parser {
+    std::string m_header;        // "GET / HTTP/1.1\r\nHost: 127.0.0.1:8080\r\nUser-Agent: curl/7.81.0\r\nAccept: */*"
+    std::string m_heading_line;  // "GET / HTTP/1.1"
+    StringMap m_header_keys;     // {"Host": "127.0.0.1:8080", "Accept": "*/*", ...}
+    std::string m_body;          // The over-reading body (if exists)
+    size_t content_length;
+    bool m_header_finished;
+    bool m_body_finished;
+
+    void _parse_header() {
+        size_t pos = m_header.find("\r\n");
+        while (pos != std::string::npos) {
+            pos += 2; // skip "\r\n"
+            size_t next_pos = m_header.find("\r\n", pos);
+            size_t line_len = std::string::npos;
+            if (next_pos != std::string::npos) {
+                line_len = next_pos - pos;
+            }
+            std::string line = m_header.substr(pos, line_len);
+            size_t colon = line.find(": ");
+            if (colon != std::string::npos) {
+                std::string key = line.substr(0, colon);
+                std::string value = line.substr(colon + 2);
+                std::transform(key.begin(), key.end(), key.begin(), [] (char c) {
+                    if ('A' <= c && c <= 'Z')
+                        c += 'a' - 'A';
+                    return c;
+                });
+                if (key == "content-length") {
+                    content_length = std::stoi(value);
+                }
+            }
+            pos = next_pos;
+        }
+    }
+
+    void push_chunk(std::string_view chunk) {
+
+    }
+
+    [[nodiscard]] bool header_finished() const {
+        return m_header_finished;
+    }
+};
+
+
+template <typename HeaderParser = http11_header_parser>
 struct http_request_parser {
+    HeaderParser m_header_parser;
     std::string m_header;
     std::string m_body;
+    size_t m_content_length;
     bool m_header_finished;
     bool m_body_finished;
 
@@ -116,19 +169,12 @@ struct http_request_parser {
     }
 
     void push_chunk(std::string_view chunk) {
-        if (!m_header_finished) {
-            m_header.append(chunk);
-            // find the end of header
-            size_t header_len = m_header.find("\r\n\r\n");
-            if (header_len != std::string::npos) { // the end of header is found
-                m_header_finished = true;
-                m_body = m_header.substr(header_len);
-                m_header.resize(header_len);
-                // TODO: parser the body
-                m_body_finished = true;
-            } else if (!m_body_finished) {
-                m_body.append(chunk);
+        if (!m_header_parser.header_finished()) {
+            m_header_parser.push_chunk(chunk);
+            if (m_header_parser.header_finished()) {
+                m_content_length
             }
+            
         }
     }
 };
@@ -152,9 +198,11 @@ int main() {
                 size_t n = CHECK_CALL(read, connid, buf, sizeof(buf));
                 req_parse.push_chunk(std::string_view(buf, n));
             } while (req_parse.need_more_chunks());
-            std::string req {req_parse.m_header};
-            fmt::print("Request: {}\n", req);
-            std::string res = "HTTP/1.1 200 OK\r\nServer: co_http\r\nConnection: close\r\nContent-length: 5\r\n\r\nHello";
+            std::string header = req_parse.m_header;
+            std::string body = req_parse.m_body;
+            fmt::print("Request header: {}\n", header);
+            fmt::print("Request body: {}\n", body);
+            std::string res = fmt::format("HTTP/1.1 200 OK\r\nServer: co_http\r\nConnection: close\r\nContent-length: {}\r\n\r\n{}", body.size(), body);
             fmt::print("Response: {}\n", res);
             CHECK_CALL(write, connid, res.data(), res.size());
             close(connid);
