@@ -181,10 +181,6 @@ struct http11_header_parser {
         return m_header_keys;
     }
 
-    int status() {
-
-    }
-
     std::string& extra_body() {
         return m_body;
     }
@@ -324,12 +320,36 @@ struct http_response_parser: public _http_parser_base<HeaderParser> {
     }
 };
 
+struct http_response_writer {
+    std::string m_buffer;
+
+    void begin_header(int status) {
+        // headline (response): "HTTP/1.1 200 OK"
+        // TODO: change "OK" according to status code
+        m_buffer = "HTTP/1.1 " + std::to_string(status) + " OK\r\n";
+    }
+
+    void write_header(std::string key, std::string value) {
+        m_buffer.append(key + ": " + value + "\r\n");
+    }
+
+    void end_header() {
+        m_buffer.append("\r\n");
+    }
+
+    std::string& buffer() {
+        return m_buffer;
+    }
+
+};
+
 std::vector<std::thread> pool;
 
 int main() {
-    fmt::print("Listening 127.0.0.1:8080\n");
+    std::string port = "8080";
+    fmt::print("Listening 127.0.0.1:{}\n", port);
     address_resolver resolver;
-    resolver.resolve("127.0.0.1", "8080");
+    resolver.resolve("127.0.0.1", port);
     auto entry = resolver.get_first_entry();
     int listenfd = entry.create_socket_and_bind();
     CHECK_CALL(listen, listenfd, SOMAXCONN);
@@ -337,19 +357,35 @@ int main() {
     while (true) {
         int connid = CHECK_CALL(accept, listenfd, &addr.m_addr, &addr.m_addrlen);
         pool.emplace_back([connid] {
-            char buf[1024];
+            char in_buffer[1024];
             _http_parser_base req_parse;
             do {
-                size_t n = CHECK_CALL(read, connid, buf, sizeof(buf));
-                req_parse.push_chunk(std::string_view(buf, n));
+                size_t n = CHECK_CALL(read, connid, in_buffer, sizeof(in_buffer));
+                req_parse.push_chunk(std::string_view(in_buffer, n));
             } while (req_parse.request_finished());
             std::string header = req_parse.headers_raw();
             std::string body = req_parse.body();
             fmt::print("Request header: {}\n", header);
             fmt::print("Request body: {}\n", body);
-            std::string res = fmt::format("HTTP/1.1 200 OK\r\nServer: co_http\r\nConnection: close\r\nContent-length: {}\r\n\r\n{}", body.size(), body);
-            fmt::print("Response: {}\n", res);
-            CHECK_CALL(write, connid, res.data(), res.size());
+
+            if (body.empty()) {
+                body = "<font color=\"red\"><b>请求为空</b></font>";
+            } else {
+                body = "<font color=\"red\"><b>你的请求是: [" + body + "]</b></font>";
+            }
+
+            http_response_writer res_writer;
+            res_writer.begin_header(200);
+            res_writer.write_header("Server", "cpp_http");
+            res_writer.write_header("Content-type", "text/html;charset=utf-8");
+            res_writer.write_header("Connecetion", "close");
+            res_writer.write_header("Content-length", std::to_string(body.size()));
+            res_writer.end_header(); // "\r\n\r\n"
+            std::string& out_buffer = res_writer.buffer();
+            CHECK_CALL(write, connid, out_buffer.data(), out_buffer.size());
+            CHECK_CALL(write, connid, body.data(), body.size());
+            fmt::print("Response header: {}\n", out_buffer.data());
+            fmt::print("Response body: {}\n", body.data());
             close(connid);
         });
     }
