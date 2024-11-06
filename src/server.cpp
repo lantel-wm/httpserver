@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdio>
 #include <cstring>
+#include <exception>
 #include <fmt/format.h>
 #include <map>
 #include <stdexcept>
@@ -11,20 +12,37 @@
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <netdb.h>
+#include <system_error>
 #include <thread>
 #include <unistd.h>
 #include <vector>
 
+const std::error_category& gai_category() {
+    struct gai_category final : public std::error_category  {
+        const char* name() const noexcept override {
+            return "getaddrinfo";
+        }
+        std::string message(int err) const override {
+            return gai_strerror(err);
+        }
+    };
+    // singleton
+    static gai_category instance;
+    return instance;
+} 
 
-#define CHECK_CALL(func, ...) check_error(#func, func(__VA_ARGS__))
-
-int check_error(const char* msg, int res) {
+template <typename T>
+T check_error(const char* msg, T res) {
     if (res == -1) {
-        fmt::print("{}: {}\n", msg, strerror(errno));
-        throw;
+        fmt::print(stderr, "{}: {}\n", msg, strerror(errno));
+        auto ec = std::error_code(errno, std::system_category());
+        throw std::system_error(ec, msg);
     }
     return res;
 }
+
+#define CHECK_CALL(func, ...) check_error(#func, func(__VA_ARGS__))
+
 
 ssize_t check_error(const char* msg, ssize_t res) {
     if (res == -1) {
@@ -34,64 +52,67 @@ ssize_t check_error(const char* msg, ssize_t res) {
     return res;
 }
 
-struct socket_address_fatptr {
-    struct sockaddr* m_addr;
-    socklen_t m_addrlen;
-};
-
-struct socket_address_storage {
-    union {
-        struct sockaddr m_addr;
-        struct sockaddr_storage m_addr_storage;
-    };
-    socklen_t m_addrlen = sizeof(sockaddr_storage);
-
-    operator socket_address_fatptr() {
-        return {&m_addr, m_addrlen};
-    }
-};
-
-struct address_resolved_entry {
-    struct addrinfo* m_curr = nullptr;
-
-    socket_address_fatptr get_address() const {
-        return {m_curr->ai_addr, m_curr->ai_addrlen};
-    }
-
-    int create_socket() const {
-        int sockfd = CHECK_CALL(socket, m_curr->ai_family, m_curr->ai_socktype, m_curr->ai_protocol);
-        return sockfd;
-    }
-
-    int create_socket_and_bind() const {
-        int sockfd = create_socket();
-        socket_address_fatptr serve_addr = get_address();
-        CHECK_CALL(bind, sockfd, serve_addr.m_addr, serve_addr.m_addrlen);
-        return sockfd;
-    }
-
-    [[nodiscard]] bool next_entry() {
-        m_curr = m_curr->ai_next;
-        if (m_curr == nullptr) {
-            return false;
-        }
-        return true;
-    }
-
-};
 
 struct address_resolver {
+    struct address_ref {
+        struct sockaddr* m_addr;
+        socklen_t m_addrlen;
+    };
+
+    struct address {
+        union {
+            struct sockaddr m_addr;
+            struct sockaddr_storage m_addr_storage;
+        };
+
+        socklen_t m_addrlen = sizeof(struct sockaddr_storage);
+
+        operator address_ref() {
+            return {&m_addr, m_addrlen};
+        }
+    };
+
+    struct address_info {
+        struct addrinfo* m_curr = nullptr;
+
+        address_ref get_address() const {
+            return {m_curr->ai_addr, m_curr->ai_addrlen};
+        }
+
+        int create_socket() const {
+            int sockfd = CHECK_CALL(socket, m_curr->ai_family, m_curr->ai_socktype, m_curr->ai_protocol);
+            return sockfd;
+        }
+
+        int create_socket_and_bind() const {
+            int sockfd = create_socket();
+            address_ref serve_addr = get_address();
+            CHECK_CALL(bind, sockfd, serve_addr.m_addr, serve_addr.m_addrlen);
+            return sockfd;
+        }
+
+        [[nodiscard]] bool next_entry() {
+            m_curr = m_curr->ai_next;
+            if (m_curr == nullptr) {
+                return false;
+            }
+            return true;
+        }
+
+    };
+
     struct addrinfo* m_head = nullptr;
 
-    void resolve(const std::string& name, const std::string& service) {
+    address_info resolve(const std::string& name, const std::string& service) {
         int err = getaddrinfo(name.c_str(), service.c_str(), NULL, &m_head);
         if (err != 0) {
-            fmt::print("getaddrinfo: {} {}", gai_strerror(err), err);
-            throw;
+            auto ec = std::error_code(err, gai_category());
+            throw std::system_error(ec, name + ":" + service);
         }
+        return {m_head};
     }
 
-    address_resolved_entry get_first_entry() {
+    address_info get_first_entry() {
         return {m_head};
     }
 
@@ -345,15 +366,15 @@ struct http_response_writer {
 
 std::vector<std::thread> pool;
 
-int main() {
-    std::string port = "8080";
+void server() {
+    std::string port = "-1";
     fmt::print("Listening 127.0.0.1:{}\n", port);
     address_resolver resolver;
     resolver.resolve("127.0.0.1", port);
     auto entry = resolver.get_first_entry();
     int listenfd = entry.create_socket_and_bind();
     CHECK_CALL(listen, listenfd, SOMAXCONN);
-    socket_address_storage addr;
+    address_resolver::address addr;
     while (true) {
         int connid = CHECK_CALL(accept, listenfd, &addr.m_addr, &addr.m_addrlen);
         pool.emplace_back([connid] {
@@ -405,5 +426,13 @@ int main() {
     for (auto& t: pool) {
         t.join();
     }
+}
+
+int main() {
+    try {
+        server();
+    } catch (const std::exception& e) {
+        fmt::print("Error: {}\n", e.what());
+    };
     return 0;
 }
