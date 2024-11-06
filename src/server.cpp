@@ -16,6 +16,7 @@
 #include <thread>
 #include <unistd.h>
 #include <vector>
+#include "bytes_buffer.hpp"
 
 const std::error_category& gai_category() {
     struct gai_category final : public std::error_category  {
@@ -390,17 +391,22 @@ void server() {
         int connid = CHECK_CALL(accept, listenfd, &addr.m_addr, &addr.m_addrlen);
         pool.emplace_back([connid] {
             while (true) {
-                char in_buffer[1024];
+                // char in_buffer[1024];
+                bytes_buffer in_buffer(1024);
                 _http_parser_base req_parse;
                 do {
-                    size_t n = CHECK_CALL(read, connid, in_buffer, sizeof(in_buffer));
+                    size_t n = CHECK_CALL_EXCEPT(ECONNRESET, read, connid, in_buffer.data(), in_buffer.size());
                     // if EOF is read, close the connection
                     if (n == 0) {
                         close(connid);
-                        fmt::print("Connection is terminated by client: {}\n", connid);
+                        fmt::print("Connection terminated due to EOF: {}\n", connid);
+                        return;
+                    } else if (n == static_cast<size_t>(-1)) {
+                        close(connid);
+                        fmt::print("Connection terninated by client: {}\n", connid);
                         return;
                     }
-                    req_parse.push_chunk(std::string_view(in_buffer, n));
+                    req_parse.push_chunk(in_buffer);
                 } while (req_parse.request_finished());
                 fmt::print("Request received: {}\n", connid);
                 std::string header = req_parse.headers_raw();
