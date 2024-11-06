@@ -357,36 +357,49 @@ int main() {
     while (true) {
         int connid = CHECK_CALL(accept, listenfd, &addr.m_addr, &addr.m_addrlen);
         pool.emplace_back([connid] {
-            char in_buffer[1024];
-            _http_parser_base req_parse;
-            do {
-                size_t n = CHECK_CALL(read, connid, in_buffer, sizeof(in_buffer));
-                req_parse.push_chunk(std::string_view(in_buffer, n));
-            } while (req_parse.request_finished());
-            std::string header = req_parse.headers_raw();
-            std::string body = req_parse.body();
-            fmt::print("Request header: {}\n", header);
-            fmt::print("Request body: {}\n", body);
+            while (true) {
+                char in_buffer[1024];
+                _http_parser_base req_parse;
+                do {
+                    size_t n = CHECK_CALL(read, connid, in_buffer, sizeof(in_buffer));
+                    // if EOF is read, close the connection
+                    if (n == 0) {
+                        close(connid);
+                        fmt::print("Connection is terminated by client: {}\n", connid);
+                        return;
+                    }
+                    req_parse.push_chunk(std::string_view(in_buffer, n));
+                } while (req_parse.request_finished());
+                fmt::print("Request received: {}\n", connid);
+                std::string header = req_parse.headers_raw();
+                std::string body = req_parse.body();
+                // fmt::print("Request header: {}\n", header);
+                // fmt::print("Request body: {}\n", body);
 
-            if (body.empty()) {
-                body = "<font color=\"red\"><b>请求为空</b></font>";
-            } else {
-                body = "<font color=\"red\"><b>你的请求是: [" + body + "]</b></font>";
+                if (body.empty()) {
+                    body = "<font color=\"red\"><b>请求为空</b></font>";
+                } else {
+                    body = "<font color=\"red\"><b>你的请求是: [" + body + "]</b></font>";
+                }
+
+                http_response_writer res_writer;
+                res_writer.begin_header(200);
+                res_writer.write_header("Server", "cpp_http");
+                res_writer.write_header("Content-type", "text/html;charset=utf-8");
+                res_writer.write_header("Connecetion", "keep-alive");
+                res_writer.write_header("Content-length", std::to_string(body.size()));
+                res_writer.end_header(); // "\r\n\r\n"
+                std::string& out_buffer = res_writer.buffer();
+                CHECK_CALL(write, connid, out_buffer.data(), out_buffer.size());
+                CHECK_CALL(write, connid, body.data(), body.size());
+
+                // fmt::print("Response header: {}\n", out_buffer.data());
+                // fmt::print("Response body: {}\n", body.data());
+                fmt::print("Responding: {}\n", connid);
             }
-
-            http_response_writer res_writer;
-            res_writer.begin_header(200);
-            res_writer.write_header("Server", "cpp_http");
-            res_writer.write_header("Content-type", "text/html;charset=utf-8");
-            res_writer.write_header("Connecetion", "close");
-            res_writer.write_header("Content-length", std::to_string(body.size()));
-            res_writer.end_header(); // "\r\n\r\n"
-            std::string& out_buffer = res_writer.buffer();
-            CHECK_CALL(write, connid, out_buffer.data(), out_buffer.size());
-            CHECK_CALL(write, connid, body.data(), body.size());
-            fmt::print("Response header: {}\n", out_buffer.data());
-            fmt::print("Response body: {}\n", body.data());
             close(connid);
+            fmt::print("Connection done: {}\n", connid);
+
         });
     }
     for (auto& t: pool) {

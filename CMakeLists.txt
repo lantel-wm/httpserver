@@ -12,3 +12,4 @@ add_executable(server src/server.cpp)
 
 find_package(fmt)
 target_link_libraries(server fmt::fmt)
+target_link_libraries(server pthread)
