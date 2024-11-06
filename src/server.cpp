@@ -31,9 +31,14 @@ const std::error_category& gai_category() {
     return instance;
 } 
 
-template <typename T>
+template <int Except = 0, typename T>
 T check_error(const char* msg, T res) {
     if (res == -1) {
+        if constexpr (Except != 0) {
+            if (errno == Except) {
+                return -1;
+            }
+        }
         fmt::print(stderr, "{}: {}\n", msg, strerror(errno));
         auto ec = std::error_code(errno, std::system_category());
         throw std::system_error(ec, msg);
@@ -41,8 +46,14 @@ T check_error(const char* msg, T res) {
     return res;
 }
 
-#define CHECK_CALL(func, ...) check_error(#func, func(__VA_ARGS__))
+#define STRINGIFY(x) #x
+#define TOSTRING(x) STRINGIFY(x)
 
+#define SOURCE_INFO_IMPL(file, line) "In " file ":" line ": "
+// #define SOURCE_INFO() SOURCE_INFO_IMPL(__FILE__, __LINE__)
+#define SOURCE_INFO() SOURCE_INFO_IMPL(__FILE__, TOSTRING(__LINE__))
+#define CHECK_CALL(func, ...) check_error(SOURCE_INFO() #func, func(__VA_ARGS__))
+#define CHECK_CALL_EXCEPT(Except, func, ...) check_error<Except>(SOURCE_INFO() #func, func(__VA_ARGS__))
 
 ssize_t check_error(const char* msg, ssize_t res) {
     if (res == -1) {
@@ -367,12 +378,12 @@ struct http_response_writer {
 std::vector<std::thread> pool;
 
 void server() {
-    std::string port = "-1";
+    std::string port = "8080";
     fmt::print("Listening 127.0.0.1:{}\n", port);
     address_resolver resolver;
     resolver.resolve("127.0.0.1", port);
-    auto entry = resolver.get_first_entry();
-    int listenfd = entry.create_socket_and_bind();
+    auto info = resolver.get_first_entry();
+    int listenfd = info.create_socket_and_bind();
     CHECK_CALL(listen, listenfd, SOMAXCONN);
     address_resolver::address addr;
     while (true) {
@@ -411,8 +422,10 @@ void server() {
                 res_writer.write_header("Content-length", std::to_string(body.size()));
                 res_writer.end_header(); // "\r\n\r\n"
                 std::string& out_buffer = res_writer.buffer();
-                CHECK_CALL(write, connid, out_buffer.data(), out_buffer.size());
-                CHECK_CALL(write, connid, body.data(), body.size());
+                if (CHECK_CALL_EXCEPT(EPIPE, write, connid, out_buffer.data(), out_buffer.size()) == -1)
+                    break;
+                if (CHECK_CALL_EXCEPT(EPIPE, write, connid, body.data(), body.size()) == -1)
+                    break;
 
                 // fmt::print("Response header: {}\n", out_buffer.data());
                 // fmt::print("Response body: {}\n", body.data());
