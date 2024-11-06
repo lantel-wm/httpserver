@@ -5,11 +5,13 @@
 #include <cstring>
 #include <exception>
 #include <fmt/format.h>
+#include <stdexcept>
 #include <string>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <thread>
 #include <unistd.h>
+#include <fcntl.h>
 #include <vector>
 #include "bytes_buffer.hpp"
 #include "http_parser.hpp"
@@ -17,7 +19,64 @@
 #include "io_context.hpp"
 #include "utils.hpp"
 
+template <typename... Args>
+using callback = std::function<void(Args...)>;
+
+struct async_file {
+    int m_fd;
+
+    static async_file async_warp(int fd) {
+        int flags = CHECK_CALL(fcntl, fd, F_GETFL);
+        flags |= O_NONBLOCK; // set file to non-block
+        CHECK_CALL(fcntl, fd, F_SETFL, flags);
+        return async_file {fd};
+    }
+
+    ssize_t sync_read(bytes_view buf) {
+        ssize_t ret;
+        do {
+            ret = CHECK_CALL_EXCEPT(EAGAIN, read, m_fd, buf.data(), buf.size());
+        } while (ret == -1);
+        return ret;
+    }
+
+    void async_read(bytes_view buf, callback<ssize_t> cb) {
+        ssize_t ret;
+        do {
+            ret = CHECK_CALL_EXCEPT(EAGAIN, read, m_fd, buf.data(), buf.size());
+        } while (ret == -1);
+        cb(ret);
+    }
+
+    ssize_t sync_write(bytes_view buf) {
+        return CHECK_CALL_EXCEPT(EPIPE, write, m_fd, buf.data(), buf.size());
+    }
+
+    size_t sync_write(std::string_view buf) {
+        return CHECK_CALL_EXCEPT(EPIPE, write, m_fd, buf.data(), buf.size());
+    }
+};
+
 std::vector<std::thread> pool;
+
+struct http_server {
+    async_file m_conn;
+    bytes_buffer m_buf {1024};
+
+    void do_read() {
+        m_conn.async_read(m_buf, [] (size_t n) {
+            if (n == 0) {
+                // fmt::print("Connection terminated due to EOF: {}\n", m_conn.m_fd);
+                do_close();
+                return;
+            }
+        });
+    }
+
+    void do_close() {
+        close(m_conn.m_fd);
+    }
+};
 
 void server() {
     std::string port = "8080";
@@ -31,23 +90,21 @@ void server() {
     while (true) {
         int connid = CHECK_CALL(accept, listenfd, &addr.m_addr, &addr.m_addrlen);
         pool.emplace_back([connid] {
+            auto conn = async_file::async_warp(connid);
             while (true) {
                 // char in_buffer[1024];
                 bytes_buffer in_buffer(1024);
                 _http_parser_base req_parse;
                 do {
-                    size_t n = CHECK_CALL_EXCEPT(ECONNRESET, read, connid, in_buffer.data(), in_buffer.size());
-                    // if EOF is read, close the connection
-                    if (n == 0) {
-                        close(connid);
-                        fmt::print("Connection terminated due to EOF: {}\n", connid);
-                        return;
-                    } else if (n == static_cast<size_t>(-1)) { // ECONNRESET caught
-                        close(connid);
-                        fmt::print("Connection terninated by client: {}\n", connid);
-                        return;
-                    }
-                    req_parse.push_chunk(in_buffer);
+                    conn.async_read(in_buffer, [] (size_t n) {
+                        // if EOF is read, close the connection
+                        if (n == 0) {
+                            close(connid);
+                            fmt::print("Connection terminated due to EOF: {}\n", connid);
+                            return;
+                        }
+                        req_parse.push_chunk(in_buffer);
+                    });
                 } while (req_parse.request_finished());
                 fmt::print("Request received: {}\n", connid);
                 std::string header = req_parse.headers_raw();
@@ -68,10 +125,10 @@ void server() {
                 res_writer.write_header("Connecetion", "keep-alive");
                 res_writer.write_header("Content-length", std::to_string(body.size()));
                 res_writer.end_header(); // "\r\n\r\n"
-                std::string& out_buffer = res_writer.buffer();
-                if (CHECK_CALL_EXCEPT(EPIPE, write, connid, out_buffer.data(), out_buffer.size()) == -1)
+                bytes_view out_buffer = res_writer.buffer();
+                if (conn.sync_write(out_buffer) == -1)
                     break; // EPIPE caught
-                if (CHECK_CALL_EXCEPT(EPIPE, write, connid, body.data(), body.size()) == -1)
+                if (conn.sync_write(body) == -1)
                     break; // EPIPE caught
 
                 // fmt::print("Response header: {}\n", out_buffer.data());
