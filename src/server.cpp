@@ -47,7 +47,7 @@ struct async_file {
     do {
       ret = CHECK_CALL_EXCEPT(EAGAIN, read, m_fd, buf.data(), buf.size());
     } while (ret == -1);
-    cb(ret);
+    cb(ret); // callback function excecuted after read is done
   }
 
   ssize_t sync_write(bytes_view buf) {
@@ -69,6 +69,7 @@ struct http_connection_handler {
   void do_init(int connfd) { m_conn = async_file::async_warp(connfd); }
 
   void do_read() {
+    fmt::print("Start reading...\n");
     m_conn.async_read(m_buf, [this](size_t n) {
       if (n == 0) {
         fmt::print("Connection terminated due to EOF: {}\n", m_conn.m_fd);
