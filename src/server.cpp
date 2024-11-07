@@ -8,11 +8,14 @@
 #include <cstddef>
 #include <cstdio>
 #include <cstring>
+#include <cwchar>
 #include <exception>
 #include <fcntl.h>
+#include <fmt/core.h>
 #include <fmt/format.h>
 #include <functional>
 #include <string>
+#include <string_view>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <thread>
@@ -58,18 +61,50 @@ struct async_file {
 
 std::vector<std::thread> pool;
 
-struct http_server {
+struct http_connection_handler {
   async_file m_conn;
   bytes_buffer m_buf{1024};
+  http_request_parser<> m_req_parser;
+
+  void do_init(int connfd) { m_conn = async_file::async_warp(connfd); }
 
   void do_read() {
-    m_conn.async_read(m_buf, [](size_t n) {
+    m_conn.async_read(m_buf, [this](size_t n) {
       if (n == 0) {
-        // fmt::print("Connection terminated due to EOF: {}\n", m_conn.m_fd);
+        fmt::print("Connection terminated due to EOF: {}\n", m_conn.m_fd);
         do_close();
         return;
       }
+      fmt::print("Read {} bytes: {}\n", n, std::string_view(m_buf.data(), n));
+      m_req_parser.push_chunk(m_buf.subspan(0, n));
+      if (!m_req_parser.request_finished()) {
+        do_read();
+      } else {
+        do_write();
+      }
     });
+  }
+
+  void do_write() {
+    std::string header = m_req_parser.headers_raw();
+    std::string body = m_req_parser.body();
+    if (body.empty()) {
+      body = "<font color=\"red\"><b>请求为空</b></font>";
+    } else {
+      body = "<font color=\"red\"><b>你的请求是: [" + body + "]</b></font>";
+    }
+    http_response_writer res_writer;
+    res_writer.begin_header(200);
+    res_writer.write_header("Server", "cpp_http");
+    res_writer.write_header("Content-type", "text/html;charset=utf-8");
+    res_writer.write_header("Connecetion", "keep-alive");
+    res_writer.write_header("Content-length", std::to_string(body.size()));
+    res_writer.end_header(); // "\r\n\r\n"
+    bytes_view out_buffer = res_writer.buffer();
+    m_conn.sync_write(out_buffer);
+    m_conn.sync_write(body);
+    fmt::print("Responding: {}\n", connid);
+    do_read(); // keep-alive
   }
 
   void do_close() { close(m_conn.m_fd); }
@@ -87,7 +122,8 @@ void server() {
   while (true) {
     int connid = CHECK_CALL(accept, listenfd, &addr.m_addr, &addr.m_addrlen);
     pool.emplace_back([connid] {
-      auto conn = async_file::async_warp(connid);
+      http_connection_handler conn_handler;
+      conn_handler.do_init(connid);
       while (true) {
         // char in_buffer[1024];
         bytes_buffer in_buffer(1024);
@@ -104,33 +140,6 @@ void server() {
           });
         } while (req_parse.request_finished());
         fmt::print("Request received: {}\n", connid);
-        std::string header = req_parse.headers_raw();
-        std::string body = req_parse.body();
-        // fmt::print("Request header: {}\n", header);
-        // fmt::print("Request body: {}\n", body);
-
-        if (body.empty()) {
-          body = "<font color=\"red\"><b>请求为空</b></font>";
-        } else {
-          body = "<font color=\"red\"><b>你的请求是: [" + body + "]</b></font>";
-        }
-
-        http_response_writer res_writer;
-        res_writer.begin_header(200);
-        res_writer.write_header("Server", "cpp_http");
-        res_writer.write_header("Content-type", "text/html;charset=utf-8");
-        res_writer.write_header("Connecetion", "keep-alive");
-        res_writer.write_header("Content-length", std::to_string(body.size()));
-        res_writer.end_header(); // "\r\n\r\n"
-        bytes_view out_buffer = res_writer.buffer();
-        if (conn.sync_write(out_buffer) == -1)
-          break; // EPIPE caught
-        if (conn.sync_write(body) == -1)
-          break; // EPIPE caught
-
-        // fmt::print("Response header: {}\n", out_buffer.data());
-        // fmt::print("Response body: {}\n", body.data());
-        fmt::print("Responding: {}\n", connid);
       }
       close(connid);
       fmt::print("Connection done: {}\n", connid);
