@@ -16,6 +16,6 @@ add_executable(server ${server_src})
 
 target_include_directories(server PRIVATE ${CMAKE_SOURCE_DIR}/include)
 
-find_package(fmt)
+find_package(fmt REQUIRED)
 target_link_libraries(server fmt::fmt)
 target_link_libraries(server pthread)
