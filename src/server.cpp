@@ -1,4 +1,5 @@
 #include "bytes_buffer.hpp"
+#include "callback.hpp"
 #include "http_parser.hpp"
 #include "http_writer.hpp"
 #include "io_context.hpp"
@@ -9,20 +10,17 @@
 #include <cstdio>
 #include <cstring>
 #include <cwchar>
-#include <exception>
 #include <fcntl.h>
 #include <fmt/core.h>
-#include <fmt/format.h>
-#include <functional>
+#include <queue>
 #include <string>
 #include <string_view>
 #include <sys/socket.h>
 #include <sys/types.h>
-#include <thread>
 #include <unistd.h>
-#include <vector>
+#include <utility>
 
-template <typename... Args> using callback = std::function<void(Args...)>;
+std::queue<callback<>> to_be_called_later;
 
 struct async_file {
   int m_fd;
@@ -44,10 +42,14 @@ struct async_file {
 
   void async_read(bytes_view buf, callback<ssize_t> cb) {
     ssize_t ret;
-    do {
-      ret = CHECK_CALL_EXCEPT(EAGAIN, read, m_fd, buf.data(), buf.size());
-    } while (ret == -1);
-    cb(ret); // callback function excecuted after read is done
+    ret = CHECK_CALL_EXCEPT(EAGAIN, read, m_fd, buf.data(), buf.size());
+    if (ret != -1) { // EAGAIN
+      cb(ret);
+    } else {
+      to_be_called_later.push([this, buf, cb = std::move(cb)]() mutable {
+        async_read(buf, std::move(cb));
+      });
+    }
   }
 
   ssize_t sync_write(bytes_view buf) {
@@ -59,25 +61,31 @@ struct async_file {
   }
 };
 
-std::vector<std::thread> pool;
-
 struct http_connection_handler {
   async_file m_conn;
   bytes_buffer m_buf{1024};
   http_request_parser<> m_req_parser;
 
-  void do_init(int connfd) { m_conn = async_file::async_warp(connfd); }
+  void do_init(int connfd) {
+    m_conn = async_file::async_warp(connfd);
+    do_read();
+  }
 
   void do_read() {
     fmt::print("Start reading...\n");
+    // hard to manage the lifetime of captured this
     m_conn.async_read(m_buf, [this](size_t n) {
       if (n == 0) {
         fmt::print("Connection terminated due to EOF: {}\n", m_conn.m_fd);
         do_close();
         return;
       }
-      fmt::print("Read {} bytes: {}\n", n, std::string_view(m_buf.data(), n));
+      // fmt::print("Read {} bytes: {}\n", n, std::string_view(m_buf.data(),
+      // n));
       m_req_parser.push_chunk(m_buf.subspan(0, n));
+      // fmt::print("request_finished: {}\n", m_req_parser.request_finished());
+      // fmt::print("header_finished: {}\n", m_req_parser.header_finished());
+      // fmt::print("body: {}\n", m_req_parser.body());
       if (!m_req_parser.request_finished()) {
         do_read();
       } else {
@@ -104,51 +112,37 @@ struct http_connection_handler {
     bytes_view out_buffer = res_writer.buffer();
     m_conn.sync_write(out_buffer);
     m_conn.sync_write(body);
-    fmt::print("Responding: {}\n", connid);
+    fmt::print("Responding.\n");
     do_read(); // keep-alive
   }
 
-  void do_close() { close(m_conn.m_fd); }
+  void do_close() {
+    close(m_conn.m_fd);
+    delete this; // the other way of managing lifetime is shared_ptr
+  }
 };
 
 void server() {
-  std::string port = "8080";
+  std::string port = "8081";
   fmt::print("Listening 127.0.0.1:{}\n", port);
   address_resolver resolver;
   resolver.resolve("127.0.0.1", port);
   auto info = resolver.get_first_entry();
   int listenfd = info.create_socket_and_bind();
   CHECK_CALL(listen, listenfd, SOMAXCONN);
+
   address_resolver::address addr;
-  while (true) {
-    int connid = CHECK_CALL(accept, listenfd, &addr.m_addr, &addr.m_addrlen);
-    pool.emplace_back([connid] {
-      http_connection_handler conn_handler;
-      conn_handler.do_init(connid);
-      while (true) {
-        // char in_buffer[1024];
-        bytes_buffer in_buffer(1024);
-        _http_parser_base req_parse;
-        do {
-          conn.async_read(in_buffer, [](size_t n) {
-            // if EOF is read, close the connection
-            if (n == 0) {
-              close(connid);
-              fmt::print("Connection terminated due to EOF: {}\n", connid);
-              return;
-            }
-            req_parse.push_chunk(in_buffer);
-          });
-        } while (req_parse.request_finished());
-        fmt::print("Request received: {}\n", connid);
-      }
-      close(connid);
-      fmt::print("Connection done: {}\n", connid);
-    });
+  int connid = CHECK_CALL(accept, listenfd, &addr.m_addr, &addr.m_addrlen);
+  fmt::print("Accept a conncetion: {}\n", connid);
+  // allocate conn_handler on heap, make it live out of this scope
+  auto conn_handler = new http_connection_handler{};
+  conn_handler->do_init(connid);
+  while (!to_be_called_later.empty()) {
+    auto task = std::move(to_be_called_later.front());
+    to_be_called_later.pop();
+    task();
   }
-  for (auto &t : pool) {
-    t.join();
-  }
+  fmt::print("All tasks are done.\n");
 }
 
 int main() {
