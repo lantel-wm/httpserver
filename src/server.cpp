@@ -1,4 +1,5 @@
 #include "bytes_buffer.hpp"
+#include "callback.hpp"
 #include "http_parser.hpp"
 #include "http_writer.hpp"
 #include "io_context.hpp"
@@ -10,18 +11,15 @@
 #include <cstring>
 #include <cwchar>
 #include <fcntl.h>
-#include <functional>
+#include <fmt/core.h>
 #include <queue>
 #include <string>
 #include <string_view>
 #include <sys/socket.h>
 #include <sys/types.h>
-#include <thread>
 #include <unistd.h>
 #include <utility>
-#include <vector>
 
-template <typename... Args> using callback = std::function<void(Args...)>;
 std::queue<callback<>> to_be_called_later;
 
 struct async_file {
@@ -45,13 +43,13 @@ struct async_file {
   void async_read(bytes_view buf, callback<ssize_t> cb) {
     ssize_t ret;
     ret = CHECK_CALL_EXCEPT(EAGAIN, read, m_fd, buf.data(), buf.size());
-    if (ret != -1) {
+    if (ret != -1) { // EAGAIN
       cb(ret);
     } else {
-      to_be_called_later.push(
-          [this, buf, cb = std::move(cb)] { async_read(buf, std::move(cb)); });
+      to_be_called_later.push([this, buf, cb = std::move(cb)]() mutable {
+        async_read(buf, std::move(cb));
+      });
     }
-    cb(ret); // callback function excecuted after read is done
   }
 
   ssize_t sync_write(bytes_view buf) {
@@ -62,8 +60,6 @@ struct async_file {
     return CHECK_CALL_EXCEPT(EPIPE, write, m_fd, buf.data(), buf.size());
   }
 };
-
-std::vector<std::thread> pool;
 
 struct http_connection_handler {
   async_file m_conn;
@@ -84,8 +80,12 @@ struct http_connection_handler {
         do_close();
         return;
       }
-      fmt::print("Read {} bytes: {}\n", n, std::string_view(m_buf.data(), n));
+      // fmt::print("Read {} bytes: {}\n", n, std::string_view(m_buf.data(),
+      // n));
       m_req_parser.push_chunk(m_buf.subspan(0, n));
+      // fmt::print("request_finished: {}\n", m_req_parser.request_finished());
+      // fmt::print("header_finished: {}\n", m_req_parser.header_finished());
+      // fmt::print("body: {}\n", m_req_parser.body());
       if (!m_req_parser.request_finished()) {
         do_read();
       } else {
@@ -118,32 +118,31 @@ struct http_connection_handler {
 
   void do_close() {
     close(m_conn.m_fd);
-    delete this;
+    delete this; // the other way of managing lifetime is shared_ptr
   }
 };
 
 void server() {
-  std::string port = "8080";
+  std::string port = "8081";
   fmt::print("Listening 127.0.0.1:{}\n", port);
   address_resolver resolver;
   resolver.resolve("127.0.0.1", port);
   auto info = resolver.get_first_entry();
   int listenfd = info.create_socket_and_bind();
   CHECK_CALL(listen, listenfd, SOMAXCONN);
+
   address_resolver::address addr;
-  while (true) {
-    int connid = CHECK_CALL(accept, listenfd, &addr.m_addr, &addr.m_addrlen);
-    fmt::print("Accept a conncetion: {}\n", connid);
-    // allocate conn_handler on heap, make it live out of this scope
-    auto conn_handler = new http_connection_handler{};
-    conn_handler->do_init(connid);
-    while (!to_be_called_later.empty()) {
-      auto task = std::move(to_be_called_later.front());
-      to_be_called_later.pop();
-      task();
-    }
-    fmt::print("All tasks are done.\n");
+  int connid = CHECK_CALL(accept, listenfd, &addr.m_addr, &addr.m_addrlen);
+  fmt::print("Accept a conncetion: {}\n", connid);
+  // allocate conn_handler on heap, make it live out of this scope
+  auto conn_handler = new http_connection_handler{};
+  conn_handler->do_init(connid);
+  while (!to_be_called_later.empty()) {
+    auto task = std::move(to_be_called_later.front());
+    to_be_called_later.pop();
+    task();
   }
+  fmt::print("All tasks are done.\n");
 }
 
 int main() {

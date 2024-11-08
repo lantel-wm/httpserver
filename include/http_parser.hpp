@@ -5,6 +5,7 @@
 #include <map>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 
 using string_map = std::map<std::string, std::string>;
 
@@ -84,7 +85,7 @@ struct _http_parser_base {
   bool m_header_finished;
   bool m_body_finished;
 
-  [[nodiscard]] bool body_finished() const {
+  [[nodiscard]] bool header_finished() const {
     return m_header_parser.header_finished();
   }
 
@@ -157,6 +158,15 @@ struct _http_parser_base {
       m_header_parser.push_chunk(chunk);
       if (m_header_parser.header_finished()) {
         m_content_length = _extract_content_length();
+        m_body = m_header_parser.extra_body();
+        if (m_body.size() == m_content_length) {
+          m_body_finished = true;
+        }
+      }
+    } else if (!m_body_finished) {
+      m_body.append(chunk);
+      if (m_body.size() == m_content_length) {
+        m_body_finished = true;
       }
     }
   }
