@@ -17,6 +17,7 @@
 #include <sys/epoll.h>
 #include <sys/socket.h>
 #include <sys/types.h>
+#include <typeinfo>
 #include <unistd.h>
 #include <utility>
 
@@ -58,9 +59,9 @@ struct async_file {
     };
 
     struct epoll_event event;
-    event.events = EPOLLIN | EPOLLET;
+    event.events = EPOLLIN | EPOLLET | EPOLLONESHOT;
     event.data.ptr = resume.leak_address();
-    epoll_ctl(epollfd, EPOLL_CTL_MOD, m_fd, &event);
+    CHECK_CALL(epoll_ctl, epollfd, EPOLL_CTL_MOD, m_fd, &event);
   }
 
   ssize_t sync_write(bytes_view buf) {
@@ -77,7 +78,23 @@ struct async_file {
     return connid;
   }
 
-  void async_accept(struct sockaddr *addr, socklen_t *addrlen, callback<> cb) {}
+  void async_accept(address_resolver::address &addr, callback<int> cb) {
+    ssize_t ret =
+        CHECK_CALL_EXCEPT(EAGAIN, accept, m_fd, &addr.m_addr, &addr.m_addrlen);
+    if (ret == -1) {
+      cb(ret);
+      return;
+    }
+
+    callback<> resume = [this, &addr, cb = std::move(cb)]() mutable {
+      async_accept(addr, std::move(cb));
+    };
+
+    struct epoll_event event;
+    event.events = EPOLLIN | EPOLLET | EPOLLONESHOT;
+    event.data.ptr = resume.leak_address();
+    CHECK_CALL(epoll_ctl, epollfd, EPOLL_CTL_MOD, m_fd, &event);
+  }
 
   // void async_accept
 
@@ -152,29 +169,37 @@ struct http_connection_accepter {
   async_file m_listen;
   address_resolver::address m_addr;
 
-  void do_init() {
-    std::string port = "8080";
-    fmt::print("Listening 127.0.0.1:{}\n", port);
+  void do_start(const std::string name, const std::string port) {
+    fmt::print("Listening {}:{}\n", name, port);
     address_resolver resolver;
-    resolver.resolve("127.0.0.1", port);
-    auto entry = resolver.get_first_entry();
-    m_listen = async_file::async_warp(entry.create_socket_and_bind());
-    m_listen.async_accept(&m_addr.m_addr, &m_addr.m_addrlen, [](int connfd) {
+    auto entry = resolver.resolve(name, port);
+    int listenfd = entry.create_socket_and_bind();
+    while (CHECK_CALL_EXCEPT(EAGAIN, listen, listenfd, SOMAXCONN) != -1)
+      ;
+
+    m_listen = async_file::async_warp(listenfd);
+    do_accept();
+  }
+
+  void do_accept() {
+    m_listen.async_accept(m_addr, [this](int connfd) {
       fmt::print("Connection accepted: {}\n", connfd);
-      http_connection_handler *conn_handler = new http_connection_handler{};
+
+      auto conn_handler = new http_connection_handler{};
+      conn_handler->do_init(connfd);
+
+      do_accept();
     });
   }
 };
 
 void server() {
-
   epollfd = epoll_create1(0);
-  // allocate conn_handler on heap, make it live out of this scope
-  auto conn_handler = new http_connection_handler{};
-  conn_handler->do_init(connid);
+
+  auto accepter = new http_connection_accepter;
+  accepter->do_start("127.0.0.1", "8080");
 
   struct epoll_event events[10];
-
   while (true) {
     int ret = epoll_wait(epollfd, events, 10, -1);
     if (ret < 0) {
@@ -186,6 +211,7 @@ void server() {
     }
   }
   fmt::print("All tasks are done.\n");
+  close(epollfd);
 }
 
 int main() {
